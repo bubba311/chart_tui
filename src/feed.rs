@@ -4,10 +4,34 @@ use crossbeam_channel::{tick, Receiver};
 
 use crate::data::Candle;
 
+#[derive(Debug, Clone, Copy)]
+pub struct OrderBookLevel {
+    pub price: f64,
+    pub size: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderBookSnapshot {
+    pub mid_price: f64,
+    pub bids: Vec<OrderBookLevel>,
+    pub asks: Vec<OrderBookLevel>,
+}
+
+impl OrderBookSnapshot {
+    pub fn empty(mid_price: f64) -> Self {
+        Self {
+            mid_price,
+            bids: Vec::new(),
+            asks: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FeedEvent {
     pub chart_id: usize,
     pub candle: Candle,
+    pub orderbook: OrderBookSnapshot,
 }
 
 pub fn start_mock_feed(chart_count: usize, interval: Duration) -> Receiver<FeedEvent> {
@@ -24,8 +48,12 @@ pub fn start_mock_feed(chart_count: usize, interval: Duration) -> Receiver<FeedE
             }
 
             for chart_id in 0..chart_count {
-                let candle = market.next_candle(chart_id, ts);
-                let event = FeedEvent { chart_id, candle };
+                let (candle, orderbook) = market.next_tick(chart_id, ts);
+                let event = FeedEvent {
+                    chart_id,
+                    candle,
+                    orderbook,
+                };
 
                 if tx.send(event).is_err() {
                     return;
@@ -56,9 +84,10 @@ impl SyntheticMarket {
         Self { series, rng }
     }
 
-    fn next_candle(&mut self, chart_id: usize, ts: u64) -> Candle {
+    fn next_tick(&mut self, chart_id: usize, ts: u64) -> (Candle, OrderBookSnapshot) {
         let Some(state) = self.series.get_mut(chart_id) else {
-            return Candle::synthetic(ts, 100.0);
+            let fallback = Candle::synthetic(ts, 100.0);
+            return (fallback, OrderBookSnapshot::empty(fallback.close));
         };
 
         if state.regime_ticks_left == 0 {
@@ -102,14 +131,68 @@ impl SyntheticMarket {
         volume = volume.max(1.0);
 
         state.last_close = close;
+        let volatility = state.volatility;
+        let base_volume = state.base_volume;
 
-        Candle {
+        let candle = Candle {
             ts,
             open: gap_open,
             high,
             low,
             close,
             volume,
+        };
+        let orderbook = self.generate_orderbook(close, volatility, base_volume);
+        (candle, orderbook)
+    }
+
+    fn generate_orderbook(
+        &mut self,
+        mid: f64,
+        volatility: f64,
+        base_volume: f64,
+    ) -> OrderBookSnapshot {
+        let levels = 14_usize;
+        let rel_spread =
+            (0.00015 + volatility * 0.10 + self.rng.range_f64(0.0, 0.00035)).clamp(0.0001, 0.01);
+        let spread = mid * rel_spread;
+        let tick = (mid * rel_spread * 0.7).max(mid * 0.00005);
+        let book_size_scale = (base_volume / 180.0).max(2.0);
+
+        let mut bids = Vec::with_capacity(levels);
+        let mut asks = Vec::with_capacity(levels);
+
+        for level in 0..levels {
+            let dist = level as f64;
+            let price_ask = (mid + spread * 0.5 + dist * tick).max(0.01);
+            let price_bid = (mid - spread * 0.5 - dist * tick).max(0.01);
+
+            let decay = 1.0 / (1.0 + dist * 0.45);
+            let skew = self.rng.range_f64(0.8, 1.2);
+            let mut ask_size = book_size_scale * decay * skew;
+            let mut bid_size = book_size_scale * decay * self.rng.range_f64(0.8, 1.2);
+
+            if self.rng.next_f64() < 0.08 {
+                ask_size *= self.rng.range_f64(1.5, 3.0);
+            }
+            if self.rng.next_f64() < 0.08 {
+                bid_size *= self.rng.range_f64(1.5, 3.0);
+            }
+
+            asks.push(OrderBookLevel {
+                price: price_ask,
+                size: ask_size.max(0.1),
+            });
+            bids.push(OrderBookLevel {
+                price: price_bid,
+                size: bid_size.max(0.1),
+            });
+        }
+
+        OrderBookSnapshot {
+            mid_price: mid,
+            bids,
+            asks,
         }
     }
 }
@@ -196,7 +279,7 @@ mod tests {
         let mut market = SyntheticMarket::new(3);
         for ts in 1..=2_000 {
             for chart_id in 0..3 {
-                let c = market.next_candle(chart_id, ts);
+                let (c, _) = market.next_tick(chart_id, ts);
                 assert!(c.low <= c.open);
                 assert!(c.low <= c.close);
                 assert!(c.high >= c.open);
@@ -204,6 +287,25 @@ mod tests {
                 assert!(c.low > 0.0);
                 assert!(c.volume >= 1.0);
             }
+        }
+    }
+
+    #[test]
+    fn synthetic_orderbook_tracks_mid_and_is_sorted() {
+        let mut market = SyntheticMarket::new(1);
+        for ts in 1..=500 {
+            let (c, ob) = market.next_tick(0, ts);
+            assert!(ob.asks.len() >= 5);
+            assert!(ob.bids.len() >= 5);
+            assert!((ob.mid_price - c.close).abs() < 1e-9);
+
+            for w in ob.asks.windows(2) {
+                assert!(w[0].price < w[1].price);
+            }
+            for w in ob.bids.windows(2) {
+                assert!(w[0].price > w[1].price);
+            }
+            assert!(ob.asks[0].price > ob.bids[0].price);
         }
     }
 }

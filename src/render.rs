@@ -11,21 +11,38 @@ use crate::app::{App, ChartPane, LayoutMode};
 use crate::perf::StatsSnapshot;
 
 const AXIS_WIDTH: u16 = 10;
+const ORDERBOOK_PANEL_WIDTH: u16 = 34;
 
 pub fn draw(frame: &mut Frame, app: &App, stats: &StatsSnapshot) {
     let base = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([Constraint::Min(1), Constraint::Length(4)])
         .split(frame.area());
     let chart_area = base[0];
     let footer_area = base[1];
 
     let visible = app.visible_pane_indices();
-    let areas = build_layout_areas(chart_area, app.layout, visible.len());
+    if app.layout == LayoutMode::Single && app.show_orderbook {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(ORDERBOOK_PANEL_WIDTH),
+            ])
+            .split(chart_area);
 
-    for (slot, pane_idx) in visible.iter().enumerate() {
-        if let (Some(area), Some(pane)) = (areas.get(slot), app.panes.get(*pane_idx)) {
-            draw_pane(frame, *area, pane, *pane_idx == app.active_pane);
+        if let Some(pane_idx) = visible.first() {
+            if let Some(pane) = app.panes.get(*pane_idx) {
+                draw_pane(frame, split[0], pane, *pane_idx == app.active_pane);
+                draw_orderbook_panel(frame, split[1], pane);
+            }
+        }
+    } else {
+        let areas = build_layout_areas(chart_area, app.layout, visible.len());
+        for (slot, pane_idx) in visible.iter().enumerate() {
+            if let (Some(area), Some(pane)) = (areas.get(slot), app.panes.get(*pane_idx)) {
+                draw_pane(frame, *area, pane, *pane_idx == app.active_pane);
+            }
         }
     }
 
@@ -42,22 +59,142 @@ pub fn draw(frame: &mut Frame, app: &App, stats: &StatsSnapshot) {
     );
     let metrics = fit_to_width(&metrics, footer_area.width as usize);
     let commands_1 = fit_to_width(
-        "keys: q quit | Tab next pane | 1/2/4 layout | [ prev tf | ] next tf",
+        "Keys: q Quit | Tab Pane | 1/2/4 Layout | o Book | [ ] Timeframe | , . Ticker",
         footer_area.width as usize,
     );
+    let ticker_line = if let Some(msg) = app.status_message.as_ref() {
+        format!(
+            "Ticker [{}]: {}  | {}",
+            if app.ticker_entry_active {
+                "typing"
+            } else {
+                "idle"
+            },
+            app.ticker_input,
+            msg
+        )
+    } else {
+        format!(
+            "Ticker [{}]: {}  | Press t to type, Enter submit, Esc clear",
+            if app.ticker_entry_active {
+                "typing"
+            } else {
+                "idle"
+            },
+            app.ticker_input
+        )
+    };
     let commands_2 = fit_to_width(
-        "      Left/Right pan | Up/Down zoom | +/- zoom",
+        "      Left/Right Pan | Up/Down or +/- Zoom",
         footer_area.width as usize,
     );
+    let ticker_line = fit_to_width(&ticker_line, footer_area.width as usize);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(metrics),
             Line::from(commands_1),
             Line::from(commands_2),
+            Line::from(ticker_line),
         ])
         .style(Style::default().fg(Color::DarkGray)),
         footer_area,
     );
+}
+
+fn draw_orderbook_panel(frame: &mut Frame, area: Rect, pane: &ChartPane) {
+    let block = Block::default()
+        .title("Order Book")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let Some(ob) = pane.latest_orderbook.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("waiting for orderbook...").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    };
+
+    let width = inner.width as usize;
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    lines.push(Line::from(fit_to_width(
+        "SIDE    PRICE     SIZE  DEPTH",
+        width,
+    )));
+    lines.push(Line::from(fit_to_width(
+        &format!("MID   {:>8.2}", ob.mid_price),
+        width,
+    )));
+    lines.push(Line::from("-----------------------------"));
+
+    let max_rows = inner.height.saturating_sub(4) as usize;
+    let asks_to_show = (max_rows / 2).max(1).min(ob.asks.len());
+    let bids_to_show = (max_rows / 2).max(1).min(ob.bids.len());
+    let max_ask = ob
+        .asks
+        .iter()
+        .take(asks_to_show)
+        .map(|l| l.size)
+        .fold(0.0, f64::max);
+    let max_bid = ob
+        .bids
+        .iter()
+        .take(bids_to_show)
+        .map(|l| l.size)
+        .fold(0.0, f64::max);
+    let bar_width = usize::from(inner.width.saturating_sub(24)).clamp(4, 9);
+
+    for lvl in ob.asks.iter().take(asks_to_show).rev() {
+        let bar = bar_for_size(lvl.size, max_ask, bar_width);
+        lines.push(Line::styled(
+            fit_to_width(
+                &format!("ASK  {:>8.2} {:>8.2} {}", lvl.price, lvl.size, bar),
+                width,
+            ),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::from("----------- spread ----------"));
+    for lvl in ob.bids.iter().take(bids_to_show) {
+        let bar = bar_for_size(lvl.size, max_bid, bar_width);
+        lines.push(Line::styled(
+            fit_to_width(
+                &format!("BID  {:>8.2} {:>8.2} {}", lvl.price, lvl.size, bar),
+                width,
+            ),
+            Style::default().fg(Color::Green),
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(Color::Gray)),
+        inner,
+    );
+}
+
+fn bar_for_size(size: f64, max_size: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if max_size <= 0.0 || !max_size.is_finite() {
+        return " ".repeat(width);
+    }
+    let filled = ((size / max_size).clamp(0.0, 1.0) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let mut out = String::with_capacity(width);
+    for _ in 0..filled {
+        out.push('█');
+    }
+    for _ in filled..width {
+        out.push('░');
+    }
+    out
 }
 
 fn fit_to_width(input: &str, width: usize) -> String {

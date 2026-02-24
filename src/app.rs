@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 
 use crate::{
     data::{Candle, CandleBuffer, ChartState},
-    feed::FeedEvent,
+    feed::{FeedEvent, OrderBookSnapshot},
     input::UserAction,
 };
 
@@ -18,6 +18,9 @@ pub const MAX_VISIBLE_PANES: usize = 4;
 pub const SINGLE_LAYOUT_THRESHOLD: usize = 900;
 pub const TWO_LAYOUT_THRESHOLD: usize = 450;
 pub const QUAD_LAYOUT_THRESHOLD: usize = 220;
+pub const SYMBOL_UNIVERSE: [&str; 12] = [
+    "AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "META", "GOOGL", "AMD", "NFLX", "PLTR", "COIN", "SPY",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
@@ -85,6 +88,8 @@ pub struct ChartPane {
     source: CandleBuffer,
     current_bucket: Option<u64>,
     auto_fit: bool,
+    pub latest_orderbook: Option<OrderBookSnapshot>,
+    price_scale: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -92,6 +97,10 @@ pub struct App {
     pub panes: Vec<ChartPane>,
     pub active_pane: usize,
     pub layout: LayoutMode,
+    pub show_orderbook: bool,
+    pub ticker_input: String,
+    pub ticker_entry_active: bool,
+    pub status_message: Option<String>,
     pub should_quit: bool,
     pane_dirty: Vec<bool>,
 }
@@ -108,6 +117,8 @@ impl App {
                 source: CandleBuffer::with_capacity(SOURCE_BUFFER_CAPACITY),
                 current_bucket: None,
                 auto_fit: true,
+                latest_orderbook: None,
+                price_scale: None,
             })
             .collect();
 
@@ -116,6 +127,10 @@ impl App {
             panes,
             active_pane: 0,
             layout: LayoutMode::Single,
+            show_orderbook: false,
+            ticker_input: String::new(),
+            ticker_entry_active: false,
+            status_message: None,
             should_quit: false,
         }
     }
@@ -134,6 +149,27 @@ impl App {
             UserAction::SetLayoutQuad => {
                 self.layout = LayoutMode::Quad;
                 self.apply_layout_thresholds();
+            }
+            UserAction::ToggleOrderBook => {
+                self.show_orderbook = !self.show_orderbook;
+            }
+            UserAction::PrevTicker => self.shift_ticker(false),
+            UserAction::NextTicker => self.shift_ticker(true),
+            UserAction::RawChar(c) => self.handle_raw_char(c),
+            UserAction::TickerBackspace => {
+                if self.ticker_entry_active {
+                    self.ticker_input.pop();
+                }
+            }
+            UserAction::TickerCancel => {
+                self.ticker_input.clear();
+                self.ticker_entry_active = false;
+                self.status_message = None;
+            }
+            UserAction::TickerSubmit => {
+                if self.ticker_entry_active {
+                    self.submit_ticker_input();
+                }
             }
             UserAction::PrevTimeframe => self.shift_timeframe(false),
             UserAction::NextTimeframe => self.shift_timeframe(true),
@@ -161,6 +197,13 @@ impl App {
                         | UserAction::SetLayoutSingle
                         | UserAction::SetLayoutTwo
                         | UserAction::SetLayoutQuad
+                        | UserAction::ToggleOrderBook
+                        | UserAction::PrevTicker
+                        | UserAction::NextTicker
+                        | UserAction::RawChar(_)
+                        | UserAction::TickerBackspace
+                        | UserAction::TickerSubmit
+                        | UserAction::TickerCancel
                         | UserAction::PrevTimeframe
                         | UserAction::NextTimeframe => false,
                     };
@@ -211,8 +254,10 @@ impl App {
         while let Ok(event) = rx.try_recv() {
             let mut changed = false;
             if let Some(pane) = self.panes.get_mut(event.chart_id) {
-                pane.source.push(event.candle);
-                if apply_base_candle_to_pane(pane, event.candle) {
+                let (scaled_candle, scaled_orderbook) = scale_feed_to_symbol(pane, &event);
+                pane.source.push(scaled_candle);
+                pane.latest_orderbook = Some(scaled_orderbook);
+                if apply_base_candle_to_pane(pane, scaled_candle) {
                     changed = true;
                 }
                 if pane.auto_fit && pane.chart.fit_to_latest(threshold) {
@@ -255,6 +300,104 @@ impl App {
         pane.auto_fit = true;
         let _ = pane.chart.fit_to_latest(threshold);
         self.mark_pane_dirty(idx);
+    }
+
+    fn shift_ticker(&mut self, forward: bool) {
+        let idx = self.active_pane;
+        let Some(pane) = self.panes.get_mut(idx) else {
+            return;
+        };
+
+        let pos = SYMBOL_UNIVERSE
+            .iter()
+            .position(|s| *s == pane.symbol.as_str())
+            .unwrap_or(0);
+        let next = if forward {
+            (pos + 1) % SYMBOL_UNIVERSE.len()
+        } else {
+            (pos + SYMBOL_UNIVERSE.len() - 1) % SYMBOL_UNIVERSE.len()
+        };
+
+        pane.symbol = SYMBOL_UNIVERSE[next].to_string();
+        reset_pane_stream_state(pane);
+        self.status_message = Some(format!("Switched to {}", pane.symbol));
+        self.mark_pane_dirty(idx);
+    }
+
+    fn submit_ticker_input(&mut self) {
+        if self.ticker_input.is_empty() {
+            self.ticker_entry_active = false;
+            return;
+        }
+
+        let symbol = self.ticker_input.to_ascii_uppercase();
+        if SYMBOL_UNIVERSE.contains(&symbol.as_str()) {
+            let idx = self.active_pane;
+            if let Some(pane) = self.panes.get_mut(idx) {
+                pane.symbol = symbol.clone();
+                reset_pane_stream_state(pane);
+                self.status_message = Some(format!("Switched to {}", symbol));
+                self.mark_pane_dirty(idx);
+            }
+        } else {
+            self.status_message = Some(format!("No data stream for {}", symbol));
+        }
+        self.ticker_input.clear();
+        self.ticker_entry_active = false;
+    }
+
+    fn handle_raw_char(&mut self, c: char) {
+        if self.ticker_entry_active {
+            if c.is_ascii_alphanumeric() && self.ticker_input.len() < 8 {
+                self.ticker_input.push(c.to_ascii_uppercase());
+            }
+            return;
+        }
+
+        match c {
+            'q' | 'Q' => self.should_quit = true,
+            '1' => {
+                self.layout = LayoutMode::Single;
+                self.apply_layout_thresholds();
+            }
+            '2' => {
+                self.layout = LayoutMode::TwoUp;
+                self.apply_layout_thresholds();
+            }
+            '4' => {
+                self.layout = LayoutMode::Quad;
+                self.apply_layout_thresholds();
+            }
+            'o' | 'O' => {
+                self.show_orderbook = !self.show_orderbook;
+            }
+            't' | 'T' => {
+                self.ticker_entry_active = true;
+                self.ticker_input.clear();
+                self.status_message = Some("Enter ticker and press Enter".to_string());
+            }
+            ',' => self.shift_ticker(false),
+            '.' => self.shift_ticker(true),
+            '[' => self.shift_timeframe(false),
+            ']' => self.shift_timeframe(true),
+            '+' | '=' => {
+                if let Some(pane) = self.panes.get_mut(self.active_pane) {
+                    if pane.chart.zoom(true) {
+                        pane.auto_fit = false;
+                        self.mark_pane_dirty(self.active_pane);
+                    }
+                }
+            }
+            '-' | '_' => {
+                if let Some(pane) = self.panes.get_mut(self.active_pane) {
+                    if pane.chart.zoom(false) {
+                        pane.auto_fit = false;
+                        self.mark_pane_dirty(self.active_pane);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn refresh_dirty_stats(&mut self) {
@@ -309,6 +452,51 @@ impl App {
     }
 }
 
+fn scale_feed_to_symbol(pane: &mut ChartPane, event: &FeedEvent) -> (Candle, OrderBookSnapshot) {
+    let target = symbol_reference_price(&pane.symbol);
+    let source_close = event.candle.close.max(0.01);
+    let scale = pane.price_scale.unwrap_or_else(|| {
+        let s = (target / source_close).clamp(0.05, 100.0);
+        pane.price_scale = Some(s);
+        s
+    });
+
+    let mut candle = event.candle;
+    candle.open = (candle.open * scale).max(0.01);
+    candle.high = (candle.high * scale).max(0.01);
+    candle.low = (candle.low * scale).max(0.01);
+    candle.close = (candle.close * scale).max(0.01);
+
+    let mut orderbook = event.orderbook.clone();
+    orderbook.mid_price = (orderbook.mid_price * scale).max(0.01);
+    for level in &mut orderbook.asks {
+        level.price = (level.price * scale).max(0.01);
+    }
+    for level in &mut orderbook.bids {
+        level.price = (level.price * scale).max(0.01);
+    }
+
+    (candle, orderbook)
+}
+
+fn symbol_reference_price(symbol: &str) -> f64 {
+    match symbol {
+        "AAPL" => 190.0,
+        "MSFT" => 420.0,
+        "TSLA" => 230.0,
+        "NVDA" => 900.0,
+        "AMZN" => 180.0,
+        "META" => 520.0,
+        "GOOGL" => 180.0,
+        "AMD" => 190.0,
+        "NFLX" => 650.0,
+        "PLTR" => 28.0,
+        "COIN" => 240.0,
+        "SPY" => 520.0,
+        _ => 100.0,
+    }
+}
+
 fn candle_bucket(ts: u64, timeframe: Timeframe) -> u64 {
     let span = timeframe.minutes();
     (ts / span) * span
@@ -355,13 +543,22 @@ fn rebuild_aggregated_chart(pane: &mut ChartPane) {
     }
 }
 
+fn reset_pane_stream_state(pane: &mut ChartPane) {
+    pane.chart = ChartState::new(CHART_BUFFER_CAPACITY, DEFAULT_VISIBLE_CANDLES);
+    pane.source = CandleBuffer::with_capacity(SOURCE_BUFFER_CAPACITY);
+    pane.current_bucket = None;
+    pane.latest_orderbook = None;
+    pane.price_scale = None;
+    pane.auto_fit = true;
+}
+
 #[cfg(test)]
 mod tests {
     use crossbeam_channel::unbounded;
 
     use crate::{
         data::{Candle, CandleBuffer, ChartState},
-        feed::FeedEvent,
+        feed::{FeedEvent, OrderBookSnapshot},
         input::UserAction,
     };
 
@@ -398,11 +595,13 @@ mod tests {
         tx.send(FeedEvent {
             chart_id: 2,
             candle: Candle::synthetic(1, 200.0),
+            orderbook: OrderBookSnapshot::empty(200.0),
         })
         .expect("send feed event");
         tx.send(FeedEvent {
             chart_id: 3,
             candle: Candle::synthetic(2, 300.0),
+            orderbook: OrderBookSnapshot::empty(300.0),
         })
         .expect("send feed event");
 
@@ -423,6 +622,7 @@ mod tests {
             tx.send(FeedEvent {
                 chart_id: 1,
                 candle: Candle::synthetic(i, 100.0 + i as f64),
+                orderbook: OrderBookSnapshot::empty(100.0 + i as f64),
             })
             .expect("send feed event");
         }
@@ -477,6 +677,7 @@ mod tests {
         tx.send(FeedEvent {
             chart_id: 0,
             candle: Candle::synthetic(1, 100.0),
+            orderbook: OrderBookSnapshot::empty(100.0),
         })
         .expect("send feed event");
         app.drain_feed(&rx);
@@ -495,6 +696,8 @@ mod tests {
             source: CandleBuffer::with_capacity(256),
             current_bucket: None,
             auto_fit: true,
+            latest_orderbook: None,
+            price_scale: None,
         };
 
         let c1 = Candle {
@@ -544,6 +747,7 @@ mod tests {
                     close: 100.5 + ts as f64,
                     volume: 10.0,
                 },
+                orderbook: OrderBookSnapshot::empty(100.5 + ts as f64),
             })
             .expect("send feed event");
         }
@@ -566,6 +770,7 @@ mod tests {
             tx.send(FeedEvent {
                 chart_id: 0,
                 candle: Candle::synthetic(ts, 100.0 + ts as f64 * 0.01),
+                orderbook: OrderBookSnapshot::empty(100.0 + ts as f64 * 0.01),
             })
             .expect("send feed event");
         }
@@ -577,5 +782,70 @@ mod tests {
 
         app.handle_action(UserAction::SetLayoutQuad);
         assert_eq!(app.panes[0].chart.visible_count(), QUAD_LAYOUT_THRESHOLD);
+    }
+
+    #[test]
+    fn ticker_switch_resets_active_pane_stream_state() {
+        let mut app = App::new();
+        let (tx, rx) = unbounded();
+
+        tx.send(FeedEvent {
+            chart_id: 0,
+            candle: Candle::synthetic(1, 150.0),
+            orderbook: OrderBookSnapshot::empty(150.0),
+        })
+        .expect("send feed event");
+        app.drain_feed(&rx);
+        assert!(app.panes[0].chart.len() > 0);
+        assert!(app.panes[0].latest_orderbook.is_some());
+
+        let old_symbol = app.panes[0].symbol.clone();
+        app.handle_action(UserAction::NextTicker);
+        assert_ne!(app.panes[0].symbol, old_symbol);
+        assert_eq!(app.panes[0].chart.len(), 0);
+        assert!(app.panes[0].latest_orderbook.is_none());
+    }
+
+    #[test]
+    fn ticker_submit_accepts_known_symbol() {
+        let mut app = App::new();
+        app.ticker_entry_active = true;
+        app.ticker_input = "AMD".to_string();
+        app.handle_action(UserAction::TickerSubmit);
+        assert_eq!(app.panes[0].symbol, "AMD");
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("Switched"));
+    }
+
+    #[test]
+    fn ticker_submit_rejects_unknown_symbol_without_switch() {
+        let mut app = App::new();
+        let before = app.panes[0].symbol.clone();
+        app.ticker_entry_active = true;
+        app.ticker_input = "ZZZZ".to_string();
+        app.handle_action(UserAction::TickerSubmit);
+        assert_eq!(app.panes[0].symbol, before);
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("No data stream"));
+    }
+
+    #[test]
+    fn ticker_entry_starts_only_after_t_key() {
+        let mut app = App::new();
+        app.handle_action(UserAction::RawChar('A'));
+        assert!(app.ticker_input.is_empty());
+
+        app.handle_action(UserAction::RawChar('t'));
+        assert!(app.ticker_entry_active);
+        app.handle_action(UserAction::RawChar('A'));
+        app.handle_action(UserAction::RawChar('M'));
+        app.handle_action(UserAction::RawChar('D'));
+        assert_eq!(app.ticker_input, "AMD");
     }
 }

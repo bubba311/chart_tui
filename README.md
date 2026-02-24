@@ -18,17 +18,26 @@ High-performance Rust TUI for multi-chart candlestick visualization with log-sca
   - Colored solid bullish/bearish bodies
   - Wick rendering
   - Last-price marker line and label
+- Single-layout orderbook popout:
+  - Toggleable right-side orderbook panel
+  - Synthetic bid/ask ladders centered on current candle close
 - Performance-focused runtime:
   - Fixed timestep frame pacing
   - Dirty-pane range recomputation
   - Runtime metrics footer (`FPS`, frame/update/render timings, feed events)
 - Stochastic synthetic data feed:
   - Regime shifts, volatility changes, spikes, gaps, and volume bursts
+  - Synthetic orderbook with dynamic spread/depth tied to volatility and volume
 
 ## Controls
 - `q`: quit
 - `Tab`: next active pane
 - `1` / `2` / `4`: switch layout
+- `o`: toggle orderbook panel (single layout)
+- `,` / `.`: previous/next ticker (active pane)
+- `t`: start ticker input mode
+- `A-Z` + `Enter`: submit ticker for active pane (from symbol universe)
+- `Esc`: cancel ticker input mode
 - `[` / `]`: previous/next timeframe (active pane)
 - `Left` / `Right`: pan (active pane)
 - `Up` / `Down`: zoom (active pane)
