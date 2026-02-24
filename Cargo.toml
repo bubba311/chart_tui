@@ -1,0 +1,12 @@
+[package]
+name = "chart_tui"
+version = "0.1.0"
+edition = "2021"
+description = "High-speed multi-chart stock candlestick TUI prototype"
+license = "MIT"
+
+[dependencies]
+crossbeam-channel = "0.5"
+crossterm = "0.29"
+ratatui = "0.29"
+smallvec = "1.13"

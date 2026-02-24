@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+
+# Cargo local config
+.cargo/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local screenshots/test captures
+Screenshot from *.png
+/screenshots/
