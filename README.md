@@ -53,7 +53,6 @@ High-performance Rust TUI for multi-chart candlestick visualization with log-sca
 
 ## Build and Run
 ```bash
-cd /home/ryan/playground/chart_tui
 cargo run
 ```
 
@@ -61,7 +60,6 @@ cargo run
 Generate a ready-to-use Schwab authorization URL:
 
 ```bash
-cd /home/ryan/playground/chart_tui
 export SCHWAB_CLIENT_ID="your_client_id"
 export SCHWAB_CLIENT_SECRET="your_client_secret"
 export SCHWAB_REDIRECT_URI="https://127.0.0.1"
