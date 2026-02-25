@@ -7,6 +7,7 @@ use crate::{
     data::{Candle, CandleBuffer, ChartState},
     feed::{FeedEvent, OrderBookSnapshot},
     input::UserAction,
+    providers::MarketEvent,
 };
 
 pub const TARGET_FPS: u64 = 30;
@@ -18,8 +19,24 @@ pub const MAX_VISIBLE_PANES: usize = 4;
 pub const SINGLE_LAYOUT_THRESHOLD: usize = 900;
 pub const TWO_LAYOUT_THRESHOLD: usize = 450;
 pub const QUAD_LAYOUT_THRESHOLD: usize = 220;
-pub const SYMBOL_UNIVERSE: [&str; 12] = [
-    "AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "META", "GOOGL", "AMD", "NFLX", "PLTR", "COIN", "SPY",
+pub const SYMBOL_UNIVERSE: [&str; 17] = [
+    "/ESH26",
+    "/VXH26",
+    "/NQH26",
+    "/RTYH26",
+    "AAPL",
+    "MSFT",
+    "TSLA",
+    "NVDA",
+    "AMZN",
+    "META",
+    "GOOGL",
+    "AMD",
+    "NFLX",
+    "PLTR",
+    "COIN",
+    "SPY",
+    "AAPL  251219C00200000",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +124,7 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let symbols = ["AAPL", "MSFT", "TSLA", "NVDA"];
+        let symbols = ["/ESH26", "/VXH26", "/NQH26", "/RTYH26"];
         let panes: Vec<ChartPane> = symbols
             .iter()
             .map(|symbol| ChartPane {
@@ -140,14 +157,27 @@ impl App {
             UserAction::Quit => self.should_quit = true,
             UserAction::SetLayoutSingle => {
                 self.layout = LayoutMode::Single;
+                if !self.panes.is_empty() {
+                    self.active_pane = self.active_pane.min(self.panes.len() - 1);
+                }
                 self.apply_layout_thresholds();
             }
             UserAction::SetLayoutTwo => {
                 self.layout = LayoutMode::TwoUp;
+                if self.panes.is_empty() {
+                    self.active_pane = 0;
+                } else {
+                    self.active_pane = self.active_pane.min(1);
+                }
                 self.apply_layout_thresholds();
             }
             UserAction::SetLayoutQuad => {
                 self.layout = LayoutMode::Quad;
+                if self.panes.is_empty() {
+                    self.active_pane = 0;
+                } else {
+                    self.active_pane = self.active_pane.min(self.panes.len().min(4) - 1);
+                }
                 self.apply_layout_thresholds();
             }
             UserAction::ToggleOrderBook => {
@@ -175,10 +205,29 @@ impl App {
             UserAction::NextTimeframe => self.shift_timeframe(true),
             UserAction::NextPane => {
                 let pane_count = self.panes.len();
-                if pane_count > 0 {
-                    self.active_pane = (self.active_pane + 1) % pane_count;
-                } else {
-                    self.active_pane = 0;
+                match self.layout {
+                    LayoutMode::Single => {
+                        if pane_count > 0 {
+                            self.active_pane = (self.active_pane + 1) % pane_count;
+                        } else {
+                            self.active_pane = 0;
+                        }
+                    }
+                    LayoutMode::TwoUp => {
+                        if pane_count <= 1 {
+                            self.active_pane = 0;
+                        } else {
+                            self.active_pane = if self.active_pane == 0 { 1 } else { 0 };
+                        }
+                    }
+                    LayoutMode::Quad => {
+                        let visible = pane_count.min(MAX_VISIBLE_PANES);
+                        if visible > 0 {
+                            self.active_pane = (self.active_pane + 1) % visible;
+                        } else {
+                            self.active_pane = 0;
+                        }
+                    }
                 }
             }
             UserAction::PanLeft
@@ -233,10 +282,9 @@ impl App {
                 out.push(self.active_pane.min(pane_count - 1));
             }
             LayoutMode::TwoUp => {
-                let first = self.active_pane.min(pane_count - 1);
-                out.push(first);
+                out.push(0);
                 if pane_count > 1 {
-                    out.push((first + 1) % pane_count);
+                    out.push(1);
                 }
             }
             LayoutMode::Quad => {
@@ -267,6 +315,37 @@ impl App {
             }
             if changed {
                 self.mark_pane_dirty(event.chart_id);
+            }
+        }
+        updated
+    }
+
+    pub fn ingest_market_events(&mut self, events: Vec<MarketEvent>) -> usize {
+        let mut updated = 0_usize;
+        let threshold = self.layout_threshold();
+        for event in events {
+            for pane_idx in 0..self.panes.len() {
+                let mut changed = false;
+                if let Some(pane) = self.panes.get_mut(pane_idx) {
+                    if pane.symbol != event.symbol {
+                        continue;
+                    }
+
+                    let (scaled_candle, scaled_orderbook) =
+                        scale_market_event_to_pane(pane, &event);
+                    pane.source.push(scaled_candle);
+                    pane.latest_orderbook = Some(scaled_orderbook);
+                    if apply_base_candle_to_pane(pane, scaled_candle) {
+                        changed = true;
+                    }
+                    if pane.auto_fit && pane.chart.fit_to_latest(threshold) {
+                        changed = true;
+                    }
+                    updated += 1;
+                }
+                if changed {
+                    self.mark_pane_dirty(pane_idx);
+                }
             }
         }
         updated
@@ -319,6 +398,7 @@ impl App {
         };
 
         pane.symbol = SYMBOL_UNIVERSE[next].to_string();
+        pane.timeframe = Timeframe::M1;
         reset_pane_stream_state(pane);
         self.status_message = Some(format!("Switched to {}", pane.symbol));
         self.mark_pane_dirty(idx);
@@ -330,11 +410,13 @@ impl App {
             return;
         }
 
-        let symbol = self.ticker_input.to_ascii_uppercase();
-        if SYMBOL_UNIVERSE.contains(&symbol.as_str()) {
+        let symbol = normalize_ticker_input(&self.ticker_input);
+        let allow_dynamic = allow_dynamic_symbols();
+        if allow_dynamic || SYMBOL_UNIVERSE.contains(&symbol.as_str()) {
             let idx = self.active_pane;
             if let Some(pane) = self.panes.get_mut(idx) {
                 pane.symbol = symbol.clone();
+                pane.timeframe = Timeframe::M1;
                 reset_pane_stream_state(pane);
                 self.status_message = Some(format!("Switched to {}", symbol));
                 self.mark_pane_dirty(idx);
@@ -348,7 +430,7 @@ impl App {
 
     fn handle_raw_char(&mut self, c: char) {
         if self.ticker_entry_active {
-            if c.is_ascii_alphanumeric() && self.ticker_input.len() < 8 {
+            if is_allowed_ticker_char(c) && self.ticker_input.len() < 32 {
                 self.ticker_input.push(c.to_ascii_uppercase());
             }
             return;
@@ -453,48 +535,72 @@ impl App {
 }
 
 fn scale_feed_to_symbol(pane: &mut ChartPane, event: &FeedEvent) -> (Candle, OrderBookSnapshot) {
-    let target = symbol_reference_price(&pane.symbol);
-    let source_close = event.candle.close.max(0.01);
-    let scale = pane.price_scale.unwrap_or_else(|| {
-        let s = (target / source_close).clamp(0.05, 100.0);
-        pane.price_scale = Some(s);
-        s
-    });
-
-    let mut candle = event.candle;
-    candle.open = (candle.open * scale).max(0.01);
-    candle.high = (candle.high * scale).max(0.01);
-    candle.low = (candle.low * scale).max(0.01);
-    candle.close = (candle.close * scale).max(0.01);
-
-    let mut orderbook = event.orderbook.clone();
-    orderbook.mid_price = (orderbook.mid_price * scale).max(0.01);
-    for level in &mut orderbook.asks {
-        level.price = (level.price * scale).max(0.01);
-    }
-    for level in &mut orderbook.bids {
-        level.price = (level.price * scale).max(0.01);
-    }
-
-    (candle, orderbook)
+    pane.price_scale = Some(1.0);
+    (event.candle, event.orderbook.clone())
 }
 
-fn symbol_reference_price(symbol: &str) -> f64 {
-    match symbol {
-        "AAPL" => 190.0,
-        "MSFT" => 420.0,
-        "TSLA" => 230.0,
-        "NVDA" => 900.0,
-        "AMZN" => 180.0,
-        "META" => 520.0,
-        "GOOGL" => 180.0,
-        "AMD" => 190.0,
-        "NFLX" => 650.0,
-        "PLTR" => 28.0,
-        "COIN" => 240.0,
-        "SPY" => 520.0,
-        _ => 100.0,
+fn scale_market_event_to_pane(
+    pane: &mut ChartPane,
+    event: &MarketEvent,
+) -> (Candle, OrderBookSnapshot) {
+    pane.price_scale = Some(1.0);
+    (event.candle, event.orderbook.clone())
+}
+
+fn is_allowed_ticker_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ':' | ' ')
+}
+
+fn normalize_ticker_input(input: &str) -> String {
+    let up = input.trim().to_ascii_uppercase();
+    if let Some(padded) = normalize_compact_option_symbol(&up) {
+        return padded;
     }
+    up
+}
+
+fn normalize_compact_option_symbol(input: &str) -> Option<String> {
+    let compact = input.replace(' ', "");
+    if compact.len() <= 15 {
+        return None;
+    }
+
+    let split = compact.len().saturating_sub(15);
+    let root = &compact[..split];
+    let tail = &compact[split..];
+    if root.is_empty() || root.len() > 6 {
+        return None;
+    }
+
+    let tail_bytes = tail.as_bytes();
+    if tail_bytes.len() != 15 {
+        return None;
+    }
+    if !tail_bytes[..6].iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let cp = tail_bytes[6] as char;
+    if cp != 'C' && cp != 'P' {
+        return None;
+    }
+    if !tail_bytes[7..].iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    Some(format!("{:<6}{}", root, tail))
+}
+
+fn allow_dynamic_symbols() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    let provider_is_schwab = std::env::var("CHART_TUI_PROVIDER")
+        .map(|v| v.eq_ignore_ascii_case("schwab"))
+        .unwrap_or(true);
+    let schwab_live = std::env::var("CHART_TUI_SCHWAB_MODE")
+        .map(|v| v.eq_ignore_ascii_case("live"))
+        .unwrap_or(true);
+    provider_is_schwab && schwab_live
 }
 
 fn candle_bucket(ts: u64, timeframe: Timeframe) -> u64 {
@@ -563,8 +669,9 @@ mod tests {
     };
 
     use super::{
-        apply_base_candle_to_pane, App, ChartPane, LayoutMode, Timeframe, DEFAULT_VISIBLE_CANDLES,
-        QUAD_LAYOUT_THRESHOLD, TWO_LAYOUT_THRESHOLD,
+        apply_base_candle_to_pane, is_allowed_ticker_char, normalize_ticker_input, App, ChartPane,
+        LayoutMode, Timeframe, DEFAULT_VISIBLE_CANDLES, QUAD_LAYOUT_THRESHOLD,
+        TWO_LAYOUT_THRESHOLD,
     };
 
     #[test]
@@ -647,13 +754,23 @@ mod tests {
         assert_eq!(app.visible_pane_indices().as_slice(), &[2]);
 
         app.handle_action(UserAction::SetLayoutTwo);
-        assert_eq!(app.visible_pane_indices().as_slice(), &[2, 3]);
-
-        app.active_pane = 3;
-        assert_eq!(app.visible_pane_indices().as_slice(), &[3, 0]);
+        assert_eq!(app.visible_pane_indices().as_slice(), &[0, 1]);
 
         app.handle_action(UserAction::SetLayoutQuad);
         assert_eq!(app.visible_pane_indices().as_slice(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn next_pane_in_two_layout_toggles_between_first_two() {
+        let mut app = App::new();
+        app.handle_action(UserAction::SetLayoutTwo);
+        assert_eq!(app.active_pane, 0);
+
+        app.handle_action(UserAction::NextPane);
+        assert_eq!(app.active_pane, 1);
+
+        app.handle_action(UserAction::NextPane);
+        assert_eq!(app.active_pane, 0);
     }
 
     #[test]
@@ -734,6 +851,7 @@ mod tests {
     #[test]
     fn timeframe_switch_rebuilds_from_source_history() {
         let mut app = App::new();
+        app.panes[0].timeframe = Timeframe::M1;
         let (tx, rx) = unbounded();
 
         for ts in 1..=6 {
@@ -764,6 +882,7 @@ mod tests {
     #[test]
     fn layout_threshold_caps_visible_window() {
         let mut app = App::new();
+        app.panes[0].timeframe = Timeframe::M1;
         let (tx, rx) = unbounded();
 
         for ts in 1..=600 {
@@ -847,5 +966,23 @@ mod tests {
         app.handle_action(UserAction::RawChar('M'));
         app.handle_action(UserAction::RawChar('D'));
         assert_eq!(app.ticker_input, "AMD");
+    }
+
+    #[test]
+    fn compact_option_symbol_normalizes_to_padded_form() {
+        let compact = "AAPL251219C00200000";
+        assert_eq!(
+            normalize_ticker_input(compact),
+            "AAPL  251219C00200000".to_string()
+        );
+    }
+
+    #[test]
+    fn ticker_input_allows_futures_option_chars() {
+        assert!(is_allowed_ticker_char('/'));
+        assert!(is_allowed_ticker_char(' '));
+        assert!(is_allowed_ticker_char(':'));
+        assert!(is_allowed_ticker_char('A'));
+        assert!(!is_allowed_ticker_char('@'));
     }
 }

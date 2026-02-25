@@ -59,7 +59,7 @@ pub fn draw(frame: &mut Frame, app: &App, stats: &StatsSnapshot) {
     );
     let metrics = fit_to_width(&metrics, footer_area.width as usize);
     let commands_1 = fit_to_width(
-        "Keys: q Quit | Tab Pane | 1/2/4 Layout | o Book | [ ] Timeframe | , . Ticker",
+        "Keys: q Quit | Tab Pane | 1/2/4 Layout | o Book | [ ] Timeframe | , . Cycle | t Type",
         footer_area.width as usize,
     );
     let ticker_line = if let Some(msg) = app.status_message.as_ref() {
@@ -282,10 +282,15 @@ fn draw_pane(frame: &mut Frame, area: Rect, pane: &ChartPane, is_active: bool) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let (chart_area, axis_area) = split_chart_and_axis(inner);
-    draw_candles(frame.buffer_mut(), chart_area, pane);
-    draw_price_axis(frame.buffer_mut(), axis_area, pane);
-    draw_last_price_marker(frame.buffer_mut(), chart_area, axis_area, pane);
+    let (full_chart_area, axis_area) = split_chart_and_axis(inner);
+    let (price_area, volume_area) = split_price_and_volume(full_chart_area);
+    let (price_axis_area, volume_axis_area) = split_price_and_volume(axis_area);
+
+    draw_candles(frame.buffer_mut(), price_area, pane);
+    draw_volume_bars(frame.buffer_mut(), volume_area, pane);
+    draw_price_axis(frame.buffer_mut(), price_axis_area, pane);
+    draw_volume_axis(frame.buffer_mut(), volume_axis_area, pane);
+    draw_last_price_marker(frame.buffer_mut(), price_area, price_axis_area, pane);
 }
 
 fn split_chart_and_axis(area: Rect) -> (Rect, Rect) {
@@ -307,6 +312,37 @@ fn split_chart_and_axis(area: Rect) -> (Rect, Rect) {
         .split(area);
 
     (parts[0], parts[1])
+}
+
+fn split_price_and_volume(area: Rect) -> (Rect, Rect) {
+    if area.height < 8 {
+        return (
+            area,
+            Rect {
+                x: area.x,
+                y: area.y + area.height,
+                width: area.width,
+                height: 0,
+            },
+        );
+    }
+
+    let volume_h = (area.height / 5).clamp(3, 7);
+    let price_h = area.height.saturating_sub(volume_h);
+    (
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: price_h,
+        },
+        Rect {
+            x: area.x,
+            y: area.y + price_h,
+            width: area.width,
+            height: volume_h,
+        },
+    )
 }
 
 fn draw_candles(buf: &mut Buffer, area: Rect, pane: &ChartPane) {
@@ -406,6 +442,113 @@ fn draw_price_axis(buf: &mut Buffer, area: Rect, pane: &ChartPane) {
             Color::Gray,
         );
     }
+}
+
+fn draw_volume_bars(buf: &mut Buffer, area: Rect, pane: &ChartPane) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let Some((start, end)) = pane.chart.visible_indices() else {
+        return;
+    };
+    let visible = end.saturating_sub(start);
+    if visible == 0 {
+        return;
+    }
+
+    let max_volume = (start..end)
+        .filter_map(|idx| pane.chart.get(idx).map(|c| c.volume))
+        .fold(0.0_f64, f64::max);
+    if max_volume <= 0.0 {
+        return;
+    }
+
+    for x in area.x..(area.x + area.width) {
+        buf[(x, area.y)]
+            .set_symbol("─")
+            .set_style(Style::default().fg(Color::DarkGray));
+    }
+
+    let drawable_h = area.height.saturating_sub(1);
+    if drawable_h == 0 {
+        return;
+    }
+
+    for (rel, idx) in (start..end).enumerate() {
+        let Some(candle) = pane.chart.get(idx) else {
+            continue;
+        };
+
+        let x0 = area.x + ((rel as u32 * area.width as u32) / visible as u32) as u16;
+        let next = (((rel + 1) as u32 * area.width as u32) / visible as u32) as u16;
+        let mut x1 = area.x + next.saturating_sub(1).min(area.width.saturating_sub(1));
+        if x1 < x0 {
+            x1 = x0;
+        }
+
+        let bar_h = volume_bar_height(candle.volume, max_volume, drawable_h);
+        let color = if candle.close >= candle.open {
+            Color::Green
+        } else {
+            Color::Red
+        };
+        for x in x0..=x1 {
+            for step in 0..bar_h {
+                let y = area.y + area.height - 1 - step;
+                buf[(x, y)]
+                    .set_symbol("█")
+                    .set_style(Style::default().fg(color));
+            }
+        }
+    }
+}
+
+fn draw_volume_axis(buf: &mut Buffer, area: Rect, pane: &ChartPane) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Some((start, end)) = pane.chart.visible_indices() else {
+        return;
+    };
+    if end <= start {
+        return;
+    }
+
+    let max_volume = (start..end)
+        .filter_map(|idx| pane.chart.get(idx).map(|c| c.volume))
+        .fold(0.0_f64, f64::max);
+    if max_volume <= 0.0 {
+        return;
+    }
+
+    let Some(last) = pane.chart.get(end - 1) else {
+        return;
+    };
+    let drawable_h = area.height.saturating_sub(1);
+    if drawable_h == 0 {
+        return;
+    }
+    let bar_h = volume_bar_height(last.volume, max_volume, drawable_h);
+    let marker_y = area.y + area.height - bar_h;
+    let color = if last.close >= last.open {
+        Color::Green
+    } else {
+        Color::Red
+    };
+
+    buf[(area.x, marker_y)]
+        .set_symbol("▶")
+        .set_style(Style::default().fg(color));
+    let label = format!("{:>8}", format_compact_number(last.volume));
+    draw_clipped_text(
+        buf,
+        area.x + 1,
+        marker_y,
+        area.width.saturating_sub(1),
+        &label,
+        color,
+    );
 }
 
 fn draw_last_price_marker(buf: &mut Buffer, chart_area: Rect, axis_area: Rect, pane: &ChartPane) {
@@ -509,6 +652,30 @@ fn round_to_step(value: f64, step: f64) -> f64 {
     (value / step).round() * step
 }
 
+fn format_compact_number(value: f64) -> String {
+    let abs = value.abs();
+    if abs >= 1_000_000_000_000.0 {
+        format!("{:.2}T", value / 1_000_000_000_000.0)
+    } else if abs >= 1_000_000_000.0 {
+        format!("{:.2}B", value / 1_000_000_000.0)
+    } else if abs >= 1_000_000.0 {
+        format!("{:.2}M", value / 1_000_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:.2}K", value / 1_000.0)
+    } else {
+        format!("{:.0}", value)
+    }
+}
+
+fn volume_bar_height(volume: f64, max_volume: f64, max_height: u16) -> u16 {
+    if max_height == 0 || max_volume <= 0.0 || volume <= 0.0 {
+        return 0;
+    }
+    let ratio = (volume.ln_1p() / max_volume.ln_1p()).clamp(0.0, 1.0);
+    let h = (ratio * f64::from(max_height)).round() as u16;
+    h.max(1).min(max_height)
+}
+
 fn draw_clipped_text(buf: &mut Buffer, x: u16, y: u16, max_width: u16, text: &str, color: Color) {
     if max_width == 0 {
         return;
@@ -517,5 +684,26 @@ fn draw_clipped_text(buf: &mut Buffer, x: u16, y: u16, max_width: u16, text: &st
         buf[(x + i as u16, y)]
             .set_symbol(ch.encode_utf8(&mut [0; 4]))
             .set_style(Style::default().fg(color));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_compact_number, volume_bar_height};
+
+    #[test]
+    fn volume_bar_height_is_bounded_and_nonzero() {
+        assert_eq!(volume_bar_height(50.0, 100.0, 10), 9);
+        assert_eq!(volume_bar_height(1.0, 100.0, 10), 1);
+        assert_eq!(volume_bar_height(200.0, 100.0, 10), 10);
+        assert_eq!(volume_bar_height(0.0, 100.0, 10), 0);
+        assert_eq!(volume_bar_height(10.0, 0.0, 10), 0);
+    }
+
+    #[test]
+    fn compact_number_formats_with_suffixes() {
+        assert_eq!(format_compact_number(3_141_002_202.0), "3.14B");
+        assert_eq!(format_compact_number(2_500_000.0), "2.50M");
+        assert_eq!(format_compact_number(12_345.0), "12.35K");
     }
 }
